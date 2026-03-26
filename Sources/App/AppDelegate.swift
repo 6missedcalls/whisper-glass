@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     // MARK: - UI
 
     private var indicatorPanel: IndicatorPanel?
+    private var accessibilityWindow: NSWindow?
 
     // MARK: - Event Monitors
 
@@ -77,40 +78,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     // MARK: - Accessibility
 
-    private static let axPromptedKey = "WhisperGlass.axPrompted"
-
     private func ensureAccessibilityAndStartMonitor() {
         let trusted = AXIsProcessTrusted()
         let bundleID = Bundle.main.bundleIdentifier ?? "nil"
         let pid = ProcessInfo.processInfo.processIdentifier
         Self.log("AX check: trusted=\(trusted), bundleID=\(bundleID), pid=\(pid)")
 
-        if !trusted {
-            // Always prompt with the dialog — it's the only reliable way
-            // to get the app added to the Accessibility list
-            Self.log("Prompting for Accessibility...")
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-            let result = AXIsProcessTrustedWithOptions(opts)
-            Self.log("AXIsProcessTrustedWithOptions returned: \(result)")
-
-            // Poll until granted
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                var count = 0
-                while !AXIsProcessTrusted() {
-                    Thread.sleep(forTimeInterval: 1.0)
-                    count += 1
-                    if count % 5 == 0 {
-                        Self.log("Still waiting for AX... (\(count)s)")
-                    }
-                }
-                Self.log("Accessibility: granted after \(count)s")
-                DispatchQueue.main.async {
-                    self?.startHotkeyMonitor()
-                }
-            }
-        } else {
+        if trusted {
             startHotkeyMonitor()
+            return
         }
+
+        Self.log("Accessibility not granted — showing permission window")
+
+        // Show an in-app permission window that directs the user to
+        // System Settings. Polls at 300ms and auto-closes once granted.
+        let promptView = AccessibilityPromptView { [weak self] in
+            Self.log("Accessibility: granted")
+            self?.accessibilityWindow?.close()
+            self?.accessibilityWindow = nil
+            NSApp.setActivationPolicy(.accessory)
+            self?.startHotkeyMonitor()
+        }
+
+        let hostView = NSHostingView(rootView: promptView)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 400),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostView
+        window.title = "WhisperGlass"
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+
+        NSApp.setActivationPolicy(.regular)
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        accessibilityWindow = window
     }
 
     // MARK: - Hotkey Monitor
@@ -179,19 +186,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                 let modsMatch = flags & ctx.mods == ctx.mods
                 let type = event.type
 
-                // Suppress ALL keyDown/keyUp for our hotkey combo
-                // to prevent the alert sound in the focused app
+                // Only suppress events that belong to OUR hotkey combo.
+                // keyDown: must match both keyCode AND modifiers.
+                // keyUp: only suppress if we're actively recording (our combo started it).
+                //        Otherwise pass through — other shortcuts (⌘Space for Spotlight,
+                //        etc.) share keyCode 49 and need their keyUp delivered.
                 if type == .keyDown && modsMatch {
                     if !ctx.delegate.isRecording {
                         DispatchQueue.main.async { ctx.delegate.startRecording() }
                     }
                     return nil // SUPPRESS
-                } else if type == .keyUp && kc == ctx.keyCode {
-                    // Suppress keyUp for Space when we were recording
-                    // (modifiers may have already been released)
-                    if ctx.delegate.isRecording {
-                        DispatchQueue.main.async { ctx.delegate.stopRecordingAndTranscribe() }
-                    }
+                } else if type == .keyUp && ctx.delegate.isRecording {
+                    DispatchQueue.main.async { ctx.delegate.stopRecordingAndTranscribe() }
                     return nil // SUPPRESS
                 }
 
@@ -253,13 +259,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             .appendingPathComponent("wg-\(UUID().uuidString).wav")
 
         do {
-            let engine = AVAudioEngine()
-            let inputNode = engine.inputNode
-
-            // Use AVCaptureSession instead of AVAudioEngine for recording.
-            // AVAudioEngine has a well-documented bug where Bluetooth devices
-            // (AirPods) deliver 0 frames. AVCaptureSession handles Bluetooth
-            // audio input correctly and respects the system default mic.
             let captureSession = AVCaptureSession()
             guard let mic = AVCaptureDevice.default(for: .audio),
                   let micInput = try? AVCaptureDeviceInput(device: mic) else {
@@ -269,14 +268,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             captureSession.addInput(micInput)
 
             let audioOutput = AVCaptureAudioDataOutput()
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: 16000.0,
-                AVNumberOfChannelsKey: 1,
-                AVLinearPCMBitDepthKey: 32,
-                AVLinearPCMIsFloatKey: true,
-                AVLinearPCMIsNonInterleaved: false
-            ]
 
             let whisperFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,

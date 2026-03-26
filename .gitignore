@@ -30,8 +30,8 @@ DerivedData/
 .vscode/
 .idea/
 
-# Personal deploy script (contains signing identity)
-scripts/deploy.sh
+# Scripts (may contain signing identities / machine-specific paths)
+scripts/
 
 # Debug logs
 *.log
