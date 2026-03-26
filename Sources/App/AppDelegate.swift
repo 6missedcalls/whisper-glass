@@ -259,6 +259,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             .appendingPathComponent("wg-\(UUID().uuidString).wav")
 
         do {
+            // Use AVCaptureSession instead of AVAudioEngine for recording.
+            // AVAudioEngine has a well-documented bug where Bluetooth devices
+            // (AirPods) deliver 0 frames. AVCaptureSession handles Bluetooth
+            // audio input correctly and respects the system default mic.
+            //
+            // Record in the device's NATIVE format for best quality.
+            // Conversion to 16kHz mono happens after recording when reading.
             let captureSession = AVCaptureSession()
             guard let mic = AVCaptureDevice.default(for: .audio),
                   let micInput = try? AVCaptureDeviceInput(device: mic) else {
@@ -268,18 +275,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             captureSession.addInput(micInput)
 
             let audioOutput = AVCaptureAudioDataOutput()
+            // nil settings = deliver in device's native format (best quality)
+            audioOutput.audioSettings = nil
 
-            let whisperFormat = AVAudioFormat(
-                commonFormat: .pcmFormatFloat32,
-                sampleRate: 16000,
-                channels: 1,
-                interleaved: true
-            )!
-            let file = try AVAudioFile(forWriting: url, settings: whisperFormat.settings)
+            Self.log("Mic: \(mic.localizedName)")
 
-            Self.log("Mic: \(mic.localizedName), capture session")
-
-            let recorder = CaptureRecorder(file: file)
+            let recorder = CaptureRecorder(url: url)
             audioOutput.setSampleBufferDelegate(recorder, queue: DispatchQueue(label: "com.whisper-glass.capture"))
             captureSession.addOutput(audioOutput)
 
@@ -316,11 +317,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             guard let self else { return }
 
             do {
-                // Read recorded file (already 16kHz mono Float32 from AVCaptureSession)
+                // Read recorded file in native format, convert to 16kHz mono Float32
                 let audioFile = try AVAudioFile(forReading: url)
+                let srcFormat = audioFile.processingFormat
                 let frameCount = AVAudioFrameCount(audioFile.length)
 
-                AppDelegate.log("File: \(frameCount) frames")
+                AppDelegate.log("File: \(frameCount) frames, \(srcFormat.sampleRate)Hz, \(srcFormat.channelCount)ch")
 
                 guard frameCount > 800 else {  // minimum ~50ms of audio
                     AppDelegate.log("Recording too short (\(frameCount) frames)")
@@ -329,15 +331,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
                     return
                 }
 
-                // Read all frames — file is already in Whisper format (16kHz mono Float32)
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
+                guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frameCount) else {
                     await MainActor.run { self.indicatorPanel?.hide() }
                     return
                 }
-                try audioFile.read(into: buffer)
+                try audioFile.read(into: srcBuffer)
 
-                guard let floatData = buffer.floatChannelData?[0] else { return }
-                let samples = Array(UnsafeBufferPointer(start: floatData, count: Int(buffer.frameLength)))
+                // High-quality conversion to 16kHz mono Float32 for Whisper
+                let whisperFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: 16000,
+                    channels: 1,
+                    interleaved: false
+                )!
+
+                let outFrameCount = AVAudioFrameCount(Double(frameCount) * 16000.0 / srcFormat.sampleRate) + 1
+                guard let outBuffer = AVAudioPCMBuffer(pcmFormat: whisperFormat, frameCapacity: outFrameCount) else {
+                    await MainActor.run { self.indicatorPanel?.hide() }
+                    return
+                }
+
+                let converter = AVAudioConverter(from: srcFormat, to: whisperFormat)!
+                var convError: NSError?
+                var inputConsumed = false
+                converter.convert(to: outBuffer, error: &convError) { _, outStatus in
+                    if inputConsumed {
+                        outStatus.pointee = .endOfStream
+                        return nil
+                    }
+                    inputConsumed = true
+                    outStatus.pointee = .haveData
+                    return srcBuffer
+                }
+
+                guard convError == nil else {
+                    AppDelegate.log("Conversion error: \(convError!)")
+                    try? FileManager.default.removeItem(at: url)
+                    await MainActor.run { self.indicatorPanel?.hide() }
+                    return
+                }
+
+                guard let floatData = outBuffer.floatChannelData?[0] else {
+                    await MainActor.run { self.indicatorPanel?.hide() }
+                    return
+                }
+                let samples = Array(UnsafeBufferPointer(start: floatData, count: Int(outBuffer.frameLength)))
                 let duration = Double(samples.count) / 16000.0
 
                 AppDelegate.log("Transcribing \(String(format: "%.1f", duration))s...")
@@ -347,10 +385,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
                 // Filter junk
                 let junk = ["[BLANK_AUDIO]", "[MUSIC]", "[SILENCE]", "(silence)", "[NO_SPEECH]"]
-                let text = segments
+                let raw = segments
                     .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { t in !t.isEmpty && !junk.contains(where: { t.contains($0) }) }
                     .joined(separator: " ")
+
+                // Collapse runs of whitespace into single spaces
+                let text = raw.replacingOccurrences(
+                    of: "\\s+", with: " ", options: .regularExpression
+                ).trimmingCharacters(in: .whitespaces)
 
                 AppDelegate.log("Result: \"\(text)\"")
 
@@ -385,10 +428,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-        simulatePaste()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            self.restorePasteboard(pasteboard, items: saved)
+        // Brief delay to let modifier keys (⌃⇧) fully release after the
+        // hotkey before posting Cmd+V — prevents stray modifiers from
+        // leaking into the paste event or the target app inserting a space.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            self.simulatePaste()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                self.restorePasteboard(pasteboard, items: saved)
+            }
         }
         Self.log("Pasted \(text.count) chars")
     }
@@ -414,13 +463,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     }
 
     private func simulatePaste() {
-        guard let source = CGEventSource(stateID: .hidSystemState),
+        // Use a clean event source so stray modifier state (⌃⇧ from the
+        // hotkey) doesn't bleed into the Cmd+V paste event.
+        guard let source = CGEventSource(stateID: .combinedSessionState),
               let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
         else {
-            fputs("[WG] CGEvent paste failed\n", stderr)
+            Self.log("CGEvent paste failed")
             return
         }
+        // Explicitly set ONLY Cmd — no Control, Shift, or Option
         down.flags = .maskCommand
         up.flags = .maskCommand
         down.post(tap: .cghidEventTap)
@@ -494,45 +546,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
 // MARK: - AVCaptureSession Audio Recorder
 
-/// Writes AVCaptureSession audio buffers to an AVAudioFile.
+/// Writes AVCaptureSession audio buffers to a WAV file in the device's native format.
 /// AVCaptureSession handles Bluetooth (AirPods) correctly unlike AVAudioEngine.
+/// The file is created lazily from the first buffer's format description.
 final class CaptureRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
-    private let file: AVAudioFile
+    private let url: URL
+    private var file: AVAudioFile?
     private var framesWritten: Int = 0
 
-    init(file: AVAudioFile) {
-        self.file = file
+    init(url: URL) {
+        self.url = url
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-
-        let length = CMBlockBufferGetDataLength(blockBuffer)
-        var data = Data(count: length)
-        data.withUnsafeMutableBytes { rawBuffer in
-            guard let ptr = rawBuffer.baseAddress else { return }
-            CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: ptr)
-        }
-
-        // Convert CMSampleBuffer to AVAudioPCMBuffer
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
+              let format = AVAudioFormat(streamDescription: asbd) else { return }
 
-        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard let format = AVAudioFormat(streamDescription: asbd),
-              let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
-
-        pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
-
-        if let channelData = pcmBuffer.floatChannelData {
-            data.withUnsafeBytes { rawBuffer in
-                guard let src = rawBuffer.baseAddress else { return }
-                memcpy(channelData[0], src, length)
+        // Create file lazily using the actual device format
+        if file == nil {
+            do {
+                file = try AVAudioFile(forWriting: url, settings: format.settings)
+                AppDelegate.log("Recording format: \(format.sampleRate)Hz, \(format.channelCount)ch")
+            } catch {
+                AppDelegate.log("Failed to create audio file: \(error)")
+                return
             }
         }
 
+        let frameCount = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frameCount)) else { return }
+        pcmBuffer.frameLength = AVAudioFrameCount(frameCount)
+
+        // Copy sample data into PCM buffer
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let length = CMBlockBufferGetDataLength(blockBuffer)
+        let destPtr: UnsafeMutableRawPointer
+        if format.isInterleaved {
+            guard let channelData = pcmBuffer.floatChannelData else { return }
+            destPtr = UnsafeMutableRawPointer(channelData[0])
+        } else {
+            guard let channelData = pcmBuffer.floatChannelData else { return }
+            destPtr = UnsafeMutableRawPointer(channelData[0])
+        }
+        CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: destPtr)
+
         do {
-            try file.write(from: pcmBuffer)
+            try file?.write(from: pcmBuffer)
             framesWritten += frameCount
         } catch {
             AppDelegate.log("Capture write error: \(error)")

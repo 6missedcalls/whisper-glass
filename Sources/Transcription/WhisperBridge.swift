@@ -47,7 +47,9 @@ public final class WhisperBridge: @unchecked Sendable {
         }
 
         let params = WhisperParams()
-        params.language = .auto
+        // Force English on smaller models to prevent hallucinations in
+        // Chinese/Japanese. Auto-detect is unreliable on base/tiny models.
+        params.language = WhisperLanguage(rawValue: language) ?? .english
         params.translate = translateToEnglish
 
         let instance = Whisper(fromFileURL: fileURL, withParams: params)
