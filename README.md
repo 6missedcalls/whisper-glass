@@ -76,13 +76,15 @@ All models run on-device using Apple Neural Engine acceleration when available.
 ```bash
 git clone https://github.com/6missedcalls/whisper-glass.git
 cd whisper-glass
-swift build
+./scripts/run.sh
 ```
 
-Or use the included launch script which handles signing and app bundle assembly:
+This builds, assembles a signed `.app` bundle, and launches it. Signing identity is auto-detected from your keychain — no configuration needed.
+
+For a release build installed to `/Applications`:
 
 ```bash
-./scripts/run.sh
+./scripts/deploy.sh
 ```
 
 ### First Launch

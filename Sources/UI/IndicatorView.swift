@@ -23,6 +23,20 @@ public enum IndicatorState: Equatable, Sendable {
     }
 }
 
+// MARK: - Observable State Holder
+
+/// Shared observable state for the indicator panel.
+/// Using @Observable avoids replacing the NSHostingView's rootView
+/// (which triggers a constraint invalidation crash on off-screen windows).
+@Observable
+public final class IndicatorStateHolder {
+    public var current: IndicatorState = .hidden
+
+    public init(_ initial: IndicatorState = .hidden) {
+        self.current = initial
+    }
+}
+
 // MARK: - Indicator View
 
 /// SwiftUI pill that shows the current recording/transcription state.
@@ -33,6 +47,7 @@ public struct IndicatorView: View {
     // MARK: - Constants
 
     private enum Layout {
+        static let pillWidth: CGFloat = 180
         static let pillHeight: CGFloat = 40
         static let horizontalPadding: CGFloat = 16
         static let verticalPadding: CGFloat = 10
@@ -42,25 +57,18 @@ public struct IndicatorView: View {
 
     // MARK: - Properties
 
-    private let state: IndicatorState
+    private let stateHolder: IndicatorStateHolder
 
-    public init(state: IndicatorState) {
-        self.state = state
+    public init(stateHolder: IndicatorStateHolder) {
+        self.stateHolder = stateHolder
     }
 
     // MARK: - Body
 
     public var body: some View {
-        if state != .hidden {
-            pillContent
-                .transition(
-                    .asymmetric(
-                        insertion: .scale(scale: 0.8)
-                            .combined(with: .opacity),
-                        removal: .opacity
-                    )
-                )
-        }
+        pillContent
+            .opacity(stateHolder.current == .hidden ? 0 : 1)
+            .animation(.easeInOut(duration: 0.2), value: stateHolder.current)
     }
 
     // MARK: - Subviews
@@ -68,19 +76,29 @@ public struct IndicatorView: View {
     private var pillContent: some View {
         HStack(spacing: Layout.iconLabelSpacing) {
             stateIcon
-            Text(state.label)
+                .frame(width: 20, height: 16)
+            Text(displayLabel)
                 .font(.system(size: Layout.fontSize, weight: .medium))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, Layout.horizontalPadding)
         .padding(.vertical, Layout.verticalPadding)
-        .frame(height: Layout.pillHeight)
+        .frame(width: Layout.pillWidth, height: Layout.pillHeight)
         .adaptiveGlassCapsule()
+    }
+
+    private var displayLabel: String {
+        switch stateHolder.current {
+        case .recording: "Listening..."
+        case .transcribing: "Transcribing..."
+        case .done: "Done"
+        case .hidden: "Listening..."
+        }
     }
 
     @ViewBuilder
     private var stateIcon: some View {
-        switch state {
+        switch stateHolder.current {
         case .recording:
             WaveformAnimation()
         case .transcribing:
@@ -121,17 +139,17 @@ private extension View {
 
 #if DEBUG
 #Preview("Recording") {
-    IndicatorView(state: .recording)
+    IndicatorView(stateHolder: IndicatorStateHolder(.recording))
         .padding()
 }
 
 #Preview("Transcribing") {
-    IndicatorView(state: .transcribing)
+    IndicatorView(stateHolder: IndicatorStateHolder(.transcribing))
         .padding()
 }
 
 #Preview("Done") {
-    IndicatorView(state: .done)
+    IndicatorView(stateHolder: IndicatorStateHolder(.done))
         .padding()
 }
 #endif

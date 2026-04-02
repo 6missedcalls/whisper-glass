@@ -30,8 +30,13 @@ DerivedData/
 .vscode/
 .idea/
 
-# Scripts (may contain signing identities / machine-specific paths)
-scripts/
+# Environment files
+.env
+.env.*
+
+# Crash reports
+*.crash
+*.ips
 
 # Debug logs
 *.log

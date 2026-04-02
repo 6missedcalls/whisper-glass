@@ -21,12 +21,14 @@ public final class IndicatorPanel: NSPanel {
     // MARK: - Constants
 
     private enum Layout {
+        static let panelSize = NSSize(width: 200, height: 56)
         static let bottomOffset: CGFloat = 60
         static let fadeOutDuration: TimeInterval = 0.2
     }
 
     // MARK: - State
 
+    private let stateHolder = IndicatorStateHolder()
     private var hostingView: NSHostingView<IndicatorView>?
 
     // MARK: - Initialization
@@ -60,7 +62,7 @@ public final class IndicatorPanel: NSPanel {
             styleMask: styleMask
         )
 
-        let hosting = NSHostingView(rootView: IndicatorView(state: .hidden))
+        let hosting = NSHostingView(rootView: IndicatorView(stateHolder: panel.stateHolder))
         panel.contentView = hosting
         panel.hostingView = hosting
 
@@ -100,27 +102,26 @@ public final class IndicatorPanel: NSPanel {
     private func positionAtBottomCenter() {
         guard let screen = NSScreen.main else { return }
 
-        // Let the hosting view size itself, then fit the panel to it
-        if let hosting = hostingView {
-            let fittingSize = hosting.fittingSize
-            let newFrame = NSRect(
-                x: screen.visibleFrame.midX - (fittingSize.width / 2),
-                y: screen.visibleFrame.minY + Layout.bottomOffset,
-                width: fittingSize.width,
-                height: fittingSize.height
-            )
-            setFrame(newFrame, display: true)
-        }
+        let size = Layout.panelSize
+        let newFrame = NSRect(
+            x: screen.visibleFrame.midX - (size.width / 2),
+            y: screen.visibleFrame.minY + Layout.bottomOffset,
+            width: size.width,
+            height: size.height
+        )
+        setFrame(newFrame, display: true)
     }
 
     // MARK: - Public API
 
     /// Shows the panel with the given state, positioned at bottom-center.
     public func show(state: IndicatorState) {
-        updateState(state)
+        // Order on screen FIRST, then update state — avoids the
+        // NSHostingView constraint crash on off-screen windows.
         positionAtBottomCenter()
         alphaValue = 1.0
         orderFrontRegardless()
+        updateState(state)
     }
 
     /// Hides the panel with a fade-out animation.
@@ -129,6 +130,7 @@ public final class IndicatorPanel: NSPanel {
             context.duration = Layout.fadeOutDuration
             animator().alphaValue = 0
         } completionHandler: { [weak self] in
+            self?.stateHolder.current = .hidden
             self?.orderOut(nil)
             self?.alphaValue = 1.0
         }
@@ -136,7 +138,7 @@ public final class IndicatorPanel: NSPanel {
 
     /// Updates the indicator content without changing visibility.
     public func updateState(_ state: IndicatorState) {
-        hostingView?.rootView = IndicatorView(state: state)
+        stateHolder.current = state
     }
 
     // MARK: - Overrides
